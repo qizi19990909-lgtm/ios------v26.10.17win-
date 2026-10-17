@@ -129,7 +129,7 @@ def _qizi_chinese_city(value):
         return name
     key = ' '.join(name.casefold().replace('_', ' ').replace('-', ' ').split())
     # 不擅自把不认识的地名音译成错误城市，也不在中文模式混入英文。
-    return _QIZI_CITY_ZH.get(key, '城市待中文识别')
+    return _QIZI_CITY_ZH.get(key, name)  # 未翻译成功先显示真实英文，不冒充无城市
 
 
 def qizi_exit_country_city_label(proxy):
@@ -140,8 +140,8 @@ def qizi_exit_country_city_label(proxy):
     public = str(proxy.get('public_ip') or '').strip()
     source = str(proxy.get('geo_source_ip') or '').strip()
     # 当动态出口变化而新 IP 尚未完成本地 MMDB 解析时，绝不显示旧 IP 城市。
-    city = ('城市待识别' if not public or source != public
-            else _qizi_chinese_city(proxy.get('city')))
+    city = ('城市待识别' if not public or (source and source != public)
+            else _qizi_chinese_city(proxy.get('city_zh') or proxy.get('city')))
     return f"{country} {city} {public or proxy.get('host') or '?'}"
 
 
@@ -178,6 +178,9 @@ class QiziReliabilityMixin:
 
         super().__init__(*args, **kwargs)
         path = Path(getattr(self, '_qizi_live_positions_path')).parent
+        from qizi_city_translation_engine import CityTranslationCache
+        self._qizi_city_translation = CityTranslationCache(path / 'qizi_city_zh_cache.json')
+        self.after(900, self._qizi_city_translation_pulse)
         self._qizi_intent_file = path / 'qizi_location_intent.json'
         self._qizi_location_intent = {
             str(k): bool(v) for k, v in load_json_dict(self._qizi_intent_file).items()
@@ -762,8 +765,25 @@ class QiziReliabilityMixin:
             self._qizi_presence_seen[str(source)] = time.monotonic()
         return super().record_diagnostic(source, message)
 
+    def _qizi_city_translation_pulse(self):
+        if getattr(self, '_closing', False): return
+        translator = getattr(self, '_qizi_city_translation', None)
+        if translator is not None and translator.drain():
+            self.refresh_exits()
+            self.refresh_devices()
+        self.after(900, self._qizi_city_translation_pulse)
+
     def exit_label(self, proxy):
-        # 所有出口显示均走这里：右侧列表、未来出口下拉和使用统计共用。
+        # 不为翻译阻塞 Tk，也不向翻译接口提供任何出口IP或代理账号。
+        if not proxy: return qizi_exit_country_city_label(proxy)
+        city = str(proxy.get('city') or '').strip()
+        english = _qizi_chinese_city(city)
+        translator = getattr(self, '_qizi_city_translation', None)
+        if city and english == city and translator is not None:
+            translated = translator.get(city, proxy.get('country') or '')
+            if translated != city:
+                show = dict(proxy, city_zh=translated)
+                return qizi_exit_country_city_label(show)
         return qizi_exit_country_city_label(proxy)
 
     def build_ui(self):

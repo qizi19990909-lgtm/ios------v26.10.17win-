@@ -372,20 +372,8 @@ class QiziRouteControlMixin:
         return super().clear_row(ip)
 
     def new_row(self, ip):
-        row = super().new_row(ip)
-        try:
-            existing = row['route']
-            parent = existing.master
-            existing.pack_forget()
-            existing.pack(side='left', fill='x', expand=True, padx=(1, 0))
-            btn = ttk.Button(parent, text='暂停', width=5,
-                             command=lambda address=ip: self._qizi_toggle_pause(address))
-            btn.pack(side='right', padx=(0, 1), pady=1)
-            btn.configure(state='disabled')
-            row['qizi_pause_btn'] = btn
-        except Exception as exc:
-            self.log_operation('新增暂停按钮失败：'+str(exc)[:140])
-        return row
+        # 行内不再创建冗余的“暂”按钮；路线弹窗中继续保留完整暂停/续飞操作。
+        return super().new_row(ip)
 
     def _qizi_toggle_pause(self, ip):
         uid = str(self.uid_for_ip(ip) or '')

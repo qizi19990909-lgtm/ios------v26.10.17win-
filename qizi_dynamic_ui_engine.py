@@ -32,7 +32,7 @@ DYNAMIC_FORCE_ROUTE_ON_CHANGE = True
 DYNAMIC_NEARBY_KM = 0.02
 # 最后一次游走/路线发送记录的最大允许年龄；无新记录则等待，不拿旧出口MMDB冒充起点。
 DYNAMIC_MAX_POSITION_AGE_SECONDS = 120.0
-DYNAMIC_MODULE_VERSION = "3.10.19"
+DYNAMIC_MODULE_VERSION = "3.10.22"
 
 
 class QiziDynamicMixin:
@@ -57,6 +57,7 @@ class QiziDynamicMixin:
         super().__init__(*args, **kwargs)
         self._qizi_dynamic_load_coordinates()
         self._qizi_restore_dynamic_routes()
+        self._qizi_dyn_consolidate_duplicates()
         self.after(4500, self._qizi_dynamic_prune_retired)
         # 维护 API 已核实的公网 IP，不允许普通健康检测抢先覆盖而使 IP 轮换漏报。
         self._qizi_api_verified_public = {
@@ -113,7 +114,7 @@ class QiziDynamicMixin:
                 continue
             if device.get('exit_id') != '__QIZI_BLOCK__':
                 continue
-            origin, source = self._qizi_manual_panel_origin(ip, uid)
+            origin, source = self._qizi_dynamic_last_position(uid)
             self._qizi_auto_route_pending[uid] = dict(
                 ip=ip, old_exit_id=old_id, old_ids=[old_id],
                 target_exit_id=target_id,
@@ -300,9 +301,8 @@ class QiziDynamicMixin:
             active = self._qizi_auto_route_active.get(str(uid), {}) if uid else {}
             if active:
                 # “未来出口”始终显示当前冻结目的地；最新 IP 标注待到达后确认。
-                eid = active['target_id']
-                prefix = '到达待核 ' if active.get('arrived_wait') else '飞往 '
-                suffix = ' / IP待复核' if active.get('latest_target_id') != eid else ''
+                eid = active.get('latest_target_id') or active['target_id']
+                prefix, suffix = '', ''
             elif task and not eid:
                 eid = task['target_exit_id']
                 prefix, suffix = '待规划 ', ''
@@ -310,10 +310,29 @@ class QiziDynamicMixin:
                 prefix, suffix = '', ''
             if eid:
                 proxy = lookup.get(str(eid))
-                label = self.exit_label(proxy) if proxy else (self.exit_name_by_id(eid) or '禁止网络')
-                lab.configure(text=prefix + label + suffix, fg='#1565c0')
+                # 简洁显示：国家 城市 IP；不再叠加飞行、等待等状态描述。
+                label = self.exit_label(proxy) if proxy else ''
+                lab.configure(text=label, fg='#1565c0')
             else:
                 lab.configure(text='', fg='#666666')
+        # 当前出口及未来出口分别计算；每个设备对同一目的地最多预占一次。
+        for ip, device in self.devices.items():
+            uid = str(self.uid_for_ip(ip) or '')
+            pending = self._qizi_auto_route_pending.get(uid) or {}
+            active = self._qizi_auto_route_active.get(uid) or {}
+            paused = self._qizi_auto_route_paused.get(uid) or {}
+            future = str(pending.get('target_exit_id') or active.get('latest_target_id')
+                         or paused.get('latest_target_id')
+                         or device.get('qizi_dynamic_follow_exit_id') or '')
+            if not future or future not in counts:
+                continue
+            state = self.route_states.get(uid) or {}
+            counted_as_current = (str(device.get('exit_id') or '') == future and
+                                  ip in (self._qizi_usage_devices() if hasattr(self, '_qizi_usage_devices') else self.devices))
+            counted_as_route = (bool(state.get('running')) and
+                                str(state.get('target_exit_id') or '') == future)
+            if not counted_as_current and not counted_as_route:
+                counts[future] += 1
         for i, p in enumerate(exits):
             iid = str(i)
             if not self.exit_table.exists(iid):
@@ -582,7 +601,13 @@ class QiziDynamicMixin:
             elif ev[0] == 'poll':
                 _, eid, snapshot, result = ev
                 self._qizi_api_running.discard(eid)
-                self._qizi_api_apply_result(eid, snapshot, result)
+                try:
+                    self._qizi_api_apply_result(eid, snapshot, result)
+                except Exception as exc:
+                    # 单次异步回调失败不能导致整条轮询调度链停止。
+                    self.log_operation('动态IP回调异常（下一轮继续检测）：'
+                                       + type(exc).__name__ + ': ' + str(exc)[:140])
+                    self._qizi_api_next[str(eid)] = 0
         self.after(500, self._qizi_api_collect)
 
     def _qizi_api_apply_new(self, parsed, public, country, config, existing_id):
@@ -594,6 +619,16 @@ class QiziDynamicMixin:
             old = dict(p)
             candidate = dict(p)
         else:
+            # 首次添加同一API+同一出口时复用已有记录；反复点添加不会复制一大堆IP。
+            matched = next((x for x in self.exits
+                if isinstance(x.get('dynamic_api'), dict)
+                and config and x.get('dynamic_api') == config
+                and str(x.get('public_ip') or '') == str(public)
+                and all(str(x.get(k) or '') == str(parsed.get(k) or '')
+                        for k in ('host','port','username','password'))), None)
+            if matched is not None:
+                self.log_operation('动态API+公网IP已存在，直接使用现有出口，不重复新增')
+                return True
             p = None
             old = None
             candidate = dict(id=str(uuid.uuid4()), name='动态 ' + parsed['host'],
@@ -861,7 +896,11 @@ class QiziDynamicMixin:
         except (TypeError, ValueError): age = float('inf')
         if point and -5.0 <= age <= DYNAMIC_MAX_POSITION_AGE_SECONDS:
             label = str(rec.get('mode') or '定位事件')
-            return point, f'定位发送记录/{label}（{max(0,age):.0f}秒前）'
+            return point, f'最后实际发送定位/{label}（{max(0,age):.0f}秒前）'
+        # 网络变更时手机可能已经断网，最后一个游走点超过120秒仍然有价值；
+        # 仅限本次运行已有记录或24小时内的持久记录，不回退到输入框/旧路线起点。
+        if point and DYNAMIC_MAX_POSITION_AGE_SECONDS < age <= 86400:
+            return point, f'最后一次已记录定位/{rec.get("mode") or "未知"}（{age:.0f}秒前）'
         # 正在运行路线时的 state.last_lat/last_lon 是近期发送的路线坐标。
         state = (getattr(self, 'route_states', None) or {}).get(uid) or {}
         if state.get('running'):
@@ -892,7 +931,7 @@ class QiziDynamicMixin:
         if isinstance(direct, (tuple, list)) and len(direct) == 2:
             point = self._qizi_coord({'lat': direct[0], 'lon': direct[1]})
             if point: return point
-        point, source = self._qizi_manual_panel_origin(task.get('ip') or '', uid)
+        point, source = self._qizi_dynamic_last_position(uid)
         if point:
             task['start_coord'] = point
             task['start_source'] = source
@@ -900,6 +939,144 @@ class QiziDynamicMixin:
                 origin=point, source=source,
                 target_id=task.get('target_exit_id'), status='已锁定最后游走坐标，等待目标MMDB')
         return point
+
+    def _qizi_dyn_consolidate_duplicates(self):
+        """Consolidate *real* same-IP dynamic duplicates with a durable ID alias.
+
+        Never merge a manually configured static exit or unrelated active API
+        configurations. Keep an old IP if its address is genuinely different.
+        Identity rewrites do not release a network lock or finish a route.
+        """
+        exits = getattr(self, 'exits', None)
+        if not isinstance(exits, list) or not exits:
+            return 0
+        dynamic = [p for p in exits if (p.get('dynamic_api') or p.get('qizi_dynamic_retired')
+                    or str(p.get('dynamic_api_state') or '').startswith('历史出口'))]
+        # Build equivalence classes by family+public IP and by identical endpoint+IP.
+        parent = {str(p['id']): str(p['id']) for p in dynamic if p.get('id')}
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def unite(a, b):
+            x, y = find(a), find(b)
+            if x != y: parent[y] = x
+        by_family, by_endpoint = {}, {}
+        for p in dynamic:
+            eid = str(p.get('id') or '')
+            if eid not in parent: continue
+            public = str(p.get('public_ip') or '').strip()
+            if not public: continue
+            family = str(p.get('qizi_dynamic_family') or '')
+            endpoint = (public, str(p.get('host') or '').casefold(),
+                        str(p.get('port') or ''), str(p.get('username') or ''),
+                        str(p.get('password') or ''))
+            if family:
+                key = (family, public)
+                other = by_family.setdefault(key, eid)
+                if other != eid: unite(other, eid)
+            other = by_endpoint.setdefault(endpoint, eid)
+            if other != eid:
+                first = next((x for x in dynamic if str(x.get('id')) == other), None)
+                # Do not merge two independently configured active API owners.
+                if not (first and first.get('dynamic_api') and p.get('dynamic_api')
+                        and first['dynamic_api'] != p['dynamic_api']):
+                    unite(other, eid)
+        groups = {}
+        for p in dynamic:
+            eid = str(p.get('id') or '')
+            if eid in parent: groups.setdefault(find(eid), []).append(p)
+        aliases, victims = {}, []
+        for group in groups.values():
+            if len(group) < 2: continue
+            # Keep the active API owner, otherwise keep the first stable record.
+            survivor = next((x for x in group if x.get('dynamic_api')), group[0])
+            keep = str(survivor['id'])
+            for item in group:
+                old = str(item['id'])
+                if old == keep: continue
+                aliases[old] = keep
+                victims.append(item)
+                existing = survivor.setdefault('qizi_dynamic_aliases', [])
+                for alias in [old] + list(item.get('qizi_dynamic_aliases') or []):
+                    if alias not in existing and alias != keep: existing.append(alias)
+        # Also repair links of merges already committed to disk before a crash.
+        for p in dynamic:
+            eid = str(p.get('id') or '')
+            for old in p.get('qizi_dynamic_aliases') or []:
+                if str(old) != eid and old not in parent:
+                    aliases[str(old)] = eid
+        if not aliases: return 0
+        # Persist aliases with the canonical exit *before* rewriting any device refs.
+        if victims:
+            prospective = [x for x in exits if x not in victims]
+            try: self._qizi_api_saved_exits(prospective)
+            except OSError as exc:
+                self.log_operation('动态IP重复合并保存失败，保留原记录：'+str(exc)[:120]);return 0
+            exits[:] = prospective
+        def resolve(value):
+            key = str(value or '')
+            visited = set()
+            while key in aliases and key not in visited:
+                visited.add(key); key = aliases[key]
+            return key
+        def rewrite(mapping, keys):
+            changed = False
+            for key in keys:
+                if mapping.get(key) not in (None, ''):
+                    old = str(mapping[key]); new = resolve(old)
+                    if new != old:
+                        mapping[key] = new;changed = True
+            for key in ('old_ids', 'qizi_dynamic_old_ids'):
+                if isinstance(mapping.get(key), list):
+                    prev = list(mapping[key])
+                    mapping[key] = list(dict.fromkeys(resolve(v) for v in prev if v))
+                    changed |= prev != mapping[key]
+            return changed
+        modified_devices = False
+        for d in getattr(self, 'devices', {}).values():
+            modified_devices |= rewrite(d, ('exit_id', 'qizi_dynamic_source_exit_id',
+                                            'qizi_dynamic_follow_exit_id'))
+        modified_routes = False
+        for state in getattr(self, 'route_states', {}).values():
+            modified_routes |= rewrite(state, ('target_exit_id','qizi_dynamic_old_id',
+                'qizi_dynamic_original_target_id','qizi_dynamic_latest_target_id'))
+        modified_plans = False
+        for plan in getattr(self, 'route_plans', {}).values():
+            modified_plans |= rewrite(plan, ('target_exit_id',))
+        for dictionary in (self._qizi_auto_route_pending, self._qizi_auto_route_active,
+                           self._qizi_auto_route_paused):
+            for item in dictionary.values():
+                rewrite(item, ('old_exit_id','old_id','target_exit_id','target_id',
+                               'latest_target_id','verified_target_id'))
+        updated_groups = {}
+        for old_id, group in self._qizi_auto_route_groups.items():
+            key = resolve(old_id)
+            rewrite(group, ('target_id',))
+            if key in updated_groups:
+                updated_groups[key]['uids'].update(group.get('uids') or ())
+                updated_groups[key]['completed'].update(group.get('completed') or ())
+            else: updated_groups[key] = group
+        self._qizi_auto_route_groups = updated_groups
+        for name in ('_qizi_api_next', '_qizi_egress_probe_next', '_qizi_api_verified_public'):
+            d = getattr(self, name, None)
+            if isinstance(d, dict):
+                for old, new in aliases.items():
+                    if old in d:
+                        d.setdefault(new, d[old]); d.pop(old, None)
+        for rec in self._qizi_dynamic_coord_snapshots.values():
+            rewrite(rec, ('target_exit_id',))
+        try:
+            if modified_devices: self._qizi_save_devices(self.devices)
+            if modified_routes: self._save_route_state()
+            if modified_plans: self._save_route_plans()
+        except (OSError, AttributeError) as exc:
+            self.log_operation('重复合并后关联记录保存异常，后续将按别名修复：'+str(exc)[:120])
+        if victims:
+            self.log_operation(f'动态IP：已合并 {len(victims)} 条同IP同来源的冗余记录，路线/设备ID已同步迁移')
+            if hasattr(self, 'exit_table'): self.refresh_exits()
+        return len(victims)
 
     def _qizi_api_apply_result(self, eid, snapshot, result):
         p = self._qizi_find_exit(eid)
@@ -923,7 +1100,18 @@ class QiziDynamicMixin:
         p['dynamic_api_error'] = ''
         p['dynamic_api_state'] = '已验证'
         p['dynamic_api_last'] = time.strftime('%Y-%m-%d %H:%M:%S')
-        if not endpoint_changed and not public_changed:
+        # 同一个公网IP只更换代理接入参数，不应生成新UUID/新寻路任务。
+        if endpoint_changed and not public_changed:
+            updated = dict(p)
+            updated.update({k: parsed[k] for k in ('host','port','username','password')})
+            try:
+                self._qizi_api_saved_exits([updated if x is p else x for x in self.exits])
+            except OSError as exc:
+                self.log_operation('动态IP接入参数更新保存失败：'+str(exc)[:100]); return
+            p.clear(); p.update(updated)
+            self._qizi_api_route_change(eid)
+            self.log_operation('公网IP未变，仅更新对应代理接入参数；不创建重复出口')
+        if not public_changed:
             # 本轮真实HTTPS出口探测成功，健康状态与手动点击检测保持一致。
             p['status'] = '在线'
             p['last_error'] = ''
@@ -949,20 +1137,35 @@ class QiziDynamicMixin:
                          dynamic_api_last=time.strftime('%Y-%m-%d %H:%M:%S'))
         # A public IP may be recycled (123 -> 456 -> 123). Never revive an old
         # retired generation, nor hijack a separately configured manual exit.
-        # Each verified rotation must own a fresh immutable generation ID.
-        new_p = None
+        # 同一个动态API的同一公网IP只能保留一条目标记录。
+        # 只复用本动态家族或完全相同连接参数的历史记录，绝不借用其他静态出口。
+        family = str(p.get('qizi_dynamic_family') or p.get('id') or '')
+        candidate['qizi_dynamic_family'] = family
+        candidate['city'] = ''  # 新 IP 不能沿用旧 IP 的城市。
+        candidate.pop('city_zh', None)
+        old_like = [x for x in self.exits if x is not p
+                    and str(x.get('public_ip') or '') == str(actual_ip)
+                    and (str(x.get('qizi_dynamic_family') or '') == family
+                         or (x.get('qizi_dynamic_retired') and
+                             all(str(x.get(k) or '') == str(candidate.get(k) or '')
+                                 for k in ('host', 'port', 'username', 'password'))))]
+        new_p = next((x for x in old_like if str(x.get('qizi_dynamic_family') or '') == family),
+                     old_like[0] if old_like else None)
         new_id = str(new_p.get('id')) if new_p else candidate['id']
         old = dict(p)
+        old['qizi_dynamic_family'] = family
         old.pop('dynamic_api', None)
         old['dynamic_api_state'] = '历史出口（到达后删除）'
         old['qizi_dynamic_retired'] = True
         old['status'] = '历史出口（停用）'
         if new_p:
             candidate = dict(new_p)
+            candidate['qizi_dynamic_family'] = family
             candidate.pop('qizi_dynamic_retired', None)
             candidate['type'] = 'http'
+            candidate.update({k:parsed[k] for k in ('host','port','username','password')})
             candidate.update(dynamic_api=p['dynamic_api'], public_ip=actual_ip,
-                             country=country, dynamic_api_error='', dynamic_api_state='已验证',
+                             country=country, status='在线', last_error='', dynamic_api_error='', dynamic_api_state='已验证',
                              dynamic_api_last=time.strftime('%Y-%m-%d %H:%M:%S'))
             if candidate.get('geo_source_ip') != actual_ip:
                 candidate.update(geo_lat='', geo_lon='', geo_raw_lat='', geo_raw_lon='',
@@ -982,6 +1185,8 @@ class QiziDynamicMixin:
             new_p.clear(); new_p.update(candidate)
         else:
             self.exits.append(candidate)
+        # 修复版本升迁后的同IP陈旧副本（保留一切在途路线身份）。
+        self._qizi_dyn_consolidate_duplicates()
         self._qizi_api_next.pop(eid, None)
         self._qizi_api_next[new_id] = time.monotonic() + random.uniform(POLL_MIN_SECONDS, POLL_MAX_SECONDS)
         self._qizi_api_verified_public = getattr(self, '_qizi_api_verified_public', {})
@@ -993,7 +1198,12 @@ class QiziDynamicMixin:
         group['target_id'] = new_id
         for ip, uid in users:
             if not uid:
-                self.log_operation(f'{ip}：动态出口变化，但没有关联 iPhone UDID；旧出口停用，等待人工关联')
+                with self.device_lock:
+                    d = self.devices.get(ip)
+                    if d is not None:
+                        d['qizi_dynamic_source_exit_id'] = eid
+                        d['qizi_dynamic_follow_exit_id'] = new_id
+                self.log_operation(f'{ip}：动态出口变化但UDID暂缺；已保存待关联的新出口，信任后自动寻路')
                 self._qizi_dynamic_block(ip, '', '设备未关联iPhone，不能自动寻路；已禁止旧出口网络')
                 continue
             group['uids'].add(uid)
@@ -1050,7 +1260,7 @@ class QiziDynamicMixin:
                     target_ip=actual_ip, status='规划前再次换IP；起点保持首次冻结坐标')
                 self.log_operation(f'{ip}：规划前 IP 再次变化 {old_target[:8]} → {new_id[:8]}，只使用最新目标')
                 continue
-            origin, origin_source = self._qizi_manual_panel_origin(ip, uid)
+            origin, origin_source = self._qizi_dynamic_last_position(uid)
             self._qizi_auto_route_pending[uid] = dict(
                 ip=ip, target_exit_id=new_id, target_public_ip=actual_ip,
                 old_exit_id=eid, old_ids=[eid], created=time.monotonic(), next_try=0, last_wait_reason='',
@@ -1145,11 +1355,34 @@ class QiziDynamicMixin:
                           if p.get('qizi_dynamic_retired'))
         for eid in candidates:
             self._qizi_dynamic_cleanup_old(eid)
+        self._qizi_dyn_consolidate_duplicates()
 
     def _qizi_auto_route_tick(self):
         """始终用最新目标判断；路线启动之后只等待冻结航线完成。"""
         if getattr(self, '_closing', False): return
         now = time.monotonic()
+        # IP 切换时 UDID 可能临时不可用，恢复后补齐待执行任务。
+        for ip, dev in list(self.devices.items()):
+            if str(dev.get('exit_id') or '') != '__QIZI_BLOCK__': continue
+            follow = str(dev.get('qizi_dynamic_follow_exit_id') or '')
+            source_id = str(dev.get('qizi_dynamic_source_exit_id') or '')
+            uid = str(self.uid_for_ip(ip) or '')
+            if (not uid or not follow or not source_id
+                or uid in self._qizi_auto_route_pending
+                or uid in self._qizi_auto_route_active
+                or uid in self._qizi_auto_route_paused): continue
+            target = self._qizi_find_exit(follow)
+            if not target: continue
+            origin, label = self._qizi_dynamic_last_position(uid)
+            self._qizi_auto_route_pending[uid] = dict(
+                ip=ip, old_exit_id=source_id, old_ids=[source_id],
+                target_exit_id=follow, target_public_ip=str(target.get('public_ip') or ''),
+                start_coord=origin, start_source=label if origin else '',
+                was_allowed=False, next_try=0, created=now, last_wait_reason='')
+            group = self._qizi_auto_route_groups.setdefault(
+                source_id, dict(target_id=follow, uids=set(), completed=set()))
+            group['uids'].add(uid)
+            self.log_operation(f'{ip}：UDID已恢复，补建动态公网IP自动寻路；保持禁止网络')
         for uid, active in list(self._qizi_auto_route_active.items()):
             if active.get('arrived_wait') and active.get('verified_target_id'):
                 self._qizi_arrival_finish(uid)
