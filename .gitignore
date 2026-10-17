@@ -1,0 +1,38 @@
+# 根目录打包输出
+/build/
+/dist/
+
+# 根目录缓存
+/__pycache__/
+/.pytest_cache/
+
+# 根目录运行日志和临时目录
+/logs/
+/temp/
+/tmp/
+
+# 根目录运行生成文件
+/*.log
+/*.json
+/*.jsonl
+/*.ini
+/*.cfg
+/*.tmp
+/*.pyc
+/*.pyo
+/*.exe
+
+# 根目录临时压缩包
+/*.zip
+/*.7z
+/*.rar
+
+# 本地密钥
+/.env
+/*.key
+/*.pem
+
+# 注意：
+# 不忽略 ios_runtime/
+# 不忽略 packaging_runtime/
+# 不忽略 mmdb、py、spec、nsi、ico

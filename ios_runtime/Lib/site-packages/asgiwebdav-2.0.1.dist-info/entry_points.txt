@@ -1,0 +1,2 @@
+[console_scripts]
+asgi-webdav = asgi_webdav.cli:main
