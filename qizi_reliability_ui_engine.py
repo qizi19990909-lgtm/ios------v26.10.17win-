@@ -175,6 +175,12 @@ class QiziReliabilityMixin:
         # Live random-walk config is throttled independently per device.
         self._qizi_walk_config_written_at = {}
         self._qizi_stale_worker_warnings = set()
+        # All route devices share ONE Tk timer. Each iPhone retains its own DVT
+        # session (required by the iOS protocol); there is no per-device walk thread.
+        self._qizi_route_schedule = {}
+        self._qizi_route_scheduler_job = None
+        self._qizi_route_ack_waiting = {}
+        self._qizi_route_last_warning = {}
 
         super().__init__(*args, **kwargs)
         path = Path(getattr(self, '_qizi_live_positions_path')).parent
@@ -194,6 +200,7 @@ class QiziReliabilityMixin:
             scheduler.batch_size = 2
             scheduler.start_spacing = 2.0
         self.after(1800, self._qizi_reliability_tick)
+        self._qizi_route_scheduler_job = self.after(200, self._qizi_shared_route_pulse)
         self._qizi_restore_route_progress_from_state()
         self.log_operation('V3.10.18 综合稳定性修复已启用：游走/寻路实时同步、断点续飞、手动意图保护和轻量在线检测')
 
@@ -539,11 +546,82 @@ class QiziReliabilityMixin:
         self._qizi_sync_panel_coordinates(uid)
         return result
 
+    def _schedule_route_tick(self, uid, delay=1000):
+        """Coalesce all device playback timers into one cooperative Tk loop."""
+        uid = str(uid)
+        runtime = self.route_runtime.setdefault(uid, {})
+        old = runtime.get('job')
+        if old and old != 'qizi-shared-route':
+            try: self.after_cancel(old)
+            except Exception: pass
+        self._qizi_route_schedule[uid] = time.monotonic() + max(0.001, int(delay)/1000.0)
+        runtime['job'] = 'qizi-shared-route'  # truthy: no spurious resume/restart
+
+    def _qizi_shared_route_pulse(self):
+        if getattr(self, '_closing', False):
+            return
+        now = time.monotonic()
+        for uid, due in list(self._qizi_route_schedule.items()):
+            if due > now:
+                continue
+            self._qizi_route_schedule.pop(uid, None)
+            runtime = self.route_runtime.get(uid, {})
+            if runtime.get('job') != 'qizi-shared-route':
+                continue  # manual stop/pause superseded this task
+            runtime['job'] = None
+            if self.route_states.get(uid, {}).get('running'):
+                try:
+                    self._route_tick(uid)
+                except Exception as exc:
+                    state = self.route_states.get(uid, {})
+                    state['waiting_reason'] = '统一调度异常：'+str(exc)[:160]
+                    self.log_operation(f'{uid[-8:]}：{state["waiting_reason"]}')
+                    self._schedule_route_tick(uid, 2000)
+        self._qizi_route_scheduler_job = self.after(200, self._qizi_shared_route_pulse)
+
+    def _route_tick(self, uid):
+        """Never finish or advance Wi-Fi flight merely because a command entered a queue."""
+        uid = str(uid)
+        st = self.route_states.get(uid, {})
+        if st.get('running') and st.get('mode', 'WiFi模式') != 'USB数据线模式':
+            index = int(st.get('next_index', 0) or 0)
+            confirmed = int(st.get('last_confirmed_index', 0) or 0)
+            if index > 0 and confirmed < index:
+                # After restart, the old confirmation may be missing, so
+                # resend the LAST unacknowledged point rather than advancing.
+                now = time.monotonic()
+                pending = self._qizi_route_ack_waiting.get(uid)
+                if not pending or pending[0] != index:
+                    self._qizi_route_ack_waiting[uid] = (index, now)
+                    pending = (index, now)
+                elapsed = now - pending[1]
+                if elapsed >= 8.0:
+                    point = self._qizi_valid_route_point(st.get('last_lat'), st.get('last_lon'))
+                    if point and self.ios_states.get(uid, {}).get('wifi') == '连接中':
+                        self.ios.send(uid, dict(op='route', lat=point[0], lon=point[1], interval=1))
+                    self._qizi_route_ack_waiting[uid] = (index, now)
+                    if now - self._qizi_route_last_warning.get(uid, -1e12) > 15:
+                        self.log_operation(f'{st.get("ip") or uid}：航线坐标 {index} 尚无设备DVT成功回执，'
+                                           '保持禁网并重发该点，不再假装完成寻路')
+                        self._qizi_route_last_warning[uid] = now
+                self._schedule_route_tick(uid, 300)
+                return
+            self._qizi_route_ack_waiting.pop(uid, None)
+        return super()._route_tick(uid)
+
     def _start_route(self, ip, uid, mode, status_var=None, resume=False, target_exit_id=None):
         # Replay the last queued second after a restart/reconnect. A command
         # may have been queued but not ACKed when the Wi-Fi link disappeared.
         # One duplicated position is safer than silently skipping that point.
         uid = str(uid)
+        if not resume:
+            # A brand-new route must never inherit an ACK from an older flight.
+            self._qizi_route_pending_points.pop(uid, None)
+            self._qizi_route_ack_waiting.pop(uid, None)
+            state = self.route_states.get(uid, {})
+            for key in ('last_confirmed_index', 'last_confirmed_at',
+                        'last_confirmed_lat', 'last_confirmed_lon'):
+                state.pop(key, None)
         if resume:
             state = self.route_states.get(uid, {})
             generation = self.ios_states.get(uid, {}).get('generation', 0)
@@ -556,6 +634,11 @@ class QiziReliabilityMixin:
                 index = int(state.get('next_index', 0) or 0)
                 if index > 0:
                     state['next_index'] = index - 1
+                    # Previous DVT generation's ACK must not satisfy a new
+                    # session's final-arrival confirmation.
+                    old_ack = int(state.get('last_confirmed_index', 0) or 0)
+                    state['last_confirmed_index'] = min(old_ack, index - 1)
+                    state['last_confirmed_at'] = 0
                     self._save_route_state()
         return super()._start_route(ip, uid, mode, status_var,
                                     resume=resume, target_exit_id=target_exit_id)

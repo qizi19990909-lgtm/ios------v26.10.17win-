@@ -32,7 +32,7 @@ DYNAMIC_FORCE_ROUTE_ON_CHANGE = True
 DYNAMIC_NEARBY_KM = 0.02
 # 最后一次游走/路线发送记录的最大允许年龄；无新记录则等待，不拿旧出口MMDB冒充起点。
 DYNAMIC_MAX_POSITION_AGE_SECONDS = 120.0
-DYNAMIC_MODULE_VERSION = "3.10.22"
+DYNAMIC_MODULE_VERSION = "3.10.23-hotfix"
 
 
 class QiziDynamicMixin:
@@ -44,6 +44,15 @@ class QiziDynamicMixin:
         self._qizi_api_generation = {}
         self._qizi_auto_route_pending = {}
         self._qizi_auto_route_planning = set()
+        # Two shared *daemon* planning workers. Unlike an ordinary ThreadPoolExecutor,
+        # unfinished OSRM calls cannot keep the Windows GUI process alive on exit.
+        self._qizi_route_plan_jobs = queue.Queue(maxsize=256)
+        self._qizi_route_plan_stopping = threading.Event()
+        self._qizi_route_plan_threads = [
+            threading.Thread(target=self._qizi_route_plan_worker,
+                name=f'qizi-plan-shared-{i}', daemon=True) for i in range(2)]
+        for worker in self._qizi_route_plan_threads:
+            worker.start()
         self._qizi_auto_route_active = {}
         self._qizi_auto_route_paused = {}  # 用户手动暂停的动态航线，下次手动继续后仍需到达复核
         self._qizi_auto_route_groups = {}  # old exit -> target + affected UIDs
@@ -114,6 +123,22 @@ class QiziDynamicMixin:
                 continue
             if device.get('exit_id') != '__QIZI_BLOCK__':
                 continue
+            resumed_gate = device.get('qizi_dynamic_walk_gate')
+            if (isinstance(resumed_gate, dict)
+                    and str(resumed_gate.get('target_id') or '') == target_id
+                    and str(resumed_gate.get('public_ip') or '') == str(target.get('public_ip') or '')):
+                coord = self._qizi_coord(resumed_gate)
+                if coord:
+                    self._qizi_auto_route_active[uid] = dict(
+                        ip=ip, target_id=target_id, latest_target_id=target_id,
+                        verified_target_id=target_id, arrived_wait=True,
+                        frozen_dest=coord, old_id=old_id, old_ids=[old_id],
+                        qizi_walk_gate=dict(target_id=target_id,
+                            public_ip=str(target.get('public_ip') or ''),
+                            wall_started=float('inf'), first_ack=None, needs_restart=True))
+                    self.coordinates[uid] = dict(lat=str(coord[0]), lon=str(coord[1]), interval=1)
+                    self.log_operation(f'{ip}：恢复到达后游走安全门，重新等待定位回执及10秒，不提前放行')
+                    continue
             origin, source = self._qizi_dynamic_last_position(uid)
             self._qizi_auto_route_pending[uid] = dict(
                 ip=ip, old_exit_id=old_id, old_ids=[old_id],
@@ -1384,7 +1409,15 @@ class QiziDynamicMixin:
             group['uids'].add(uid)
             self.log_operation(f'{ip}：UDID已恢复，补建动态公网IP自动寻路；保持禁止网络')
         for uid, active in list(self._qizi_auto_route_active.items()):
-            if active.get('arrived_wait') and active.get('verified_target_id'):
+            if active.get('qizi_walk_gate') and str(active.get('latest_target_id')) != str(active['qizi_walk_gate']['target_id']):
+                gate = active['qizi_walk_gate']
+                self._qizi_arrival_walk_gate(uid, active, str(gate['target_id']),
+                    self._qizi_find_exit(str(gate['target_id'])) or {},
+                    self._qizi_coord({'lat': self.coordinates.get(uid, {}).get('lat'),
+                                      'lon': self.coordinates.get(uid, {}).get('lon')}),
+                    self._qizi_coord({'lat': self.coordinates.get(uid, {}).get('lat'),
+                                      'lon': self.coordinates.get(uid, {}).get('lon')}))
+            elif active.get('arrived_wait') and active.get('verified_target_id'):
                 self._qizi_arrival_finish(uid)
         for uid, task in list(self._qizi_auto_route_pending.items()):
             if uid in self._qizi_auto_route_planning or now < task.get('next_try', 0):
@@ -1478,7 +1511,12 @@ class QiziDynamicMixin:
                     self._qizi_api_results.put(('auto_plan', u, address, tid, data, None))
                 except Exception as exc:
                     self._qizi_api_results.put(('auto_plan', u, address, tid, None, str(exc)))
-            threading.Thread(target=worker, name='qizi-api-auto-route-'+uid[-8:], daemon=True).start()
+            try:
+                self._qizi_route_plan_jobs.put_nowait(worker)
+            except queue.Full:
+                self._qizi_auto_route_planning.discard(uid)
+                task['next_try'] = time.monotonic()+AUTO_ROUTE_RETRY_SECONDS
+                self.log_operation(f'{ip}：共享寻路规划队列繁忙；自动排队重试，不重复启动规划线程')
         if now - self._qizi_last_retired_prune >= 12.0:
             self._qizi_last_retired_prune = now
             self._qizi_dynamic_prune_retired()
@@ -1735,6 +1773,157 @@ class QiziDynamicMixin:
                 self.log_operation(f'{active["ip"]}：找不到有效动态 API，网络继续禁止，等待修复')
         return None
 
+    def _qizi_arrival_walk_gate(self, uid, active, target_id, proxy, dest, origin):
+        """On final arrival: verified GeoIP -> 10s real walk ACKs -> enable proxy.
+
+        Keep the device on BLOCK while route stop, geolocation handoff, and GPS
+        settle all occur. A pending/failed DVT write is never proof of arrival.
+        """
+        uid = str(uid)
+        ip = str(active.get('ip') or '')
+        point = dest or origin
+        now = time.monotonic()
+        gate = active.get('qizi_walk_gate')
+        latest = str(active.get('latest_target_id') or '')
+        if gate:
+            if latest != str(gate['target_id']):
+                # New IP appeared during the 10-second settle: do not release
+                # the stale target; start a fresh auto-route from latest GPS.
+                current, _ = self._qizi_dynamic_last_position(uid)
+                self._qizi_auto_route_pending[uid] = dict(
+                    ip=ip, old_exit_id=str(gate['target_id']),
+                    old_ids=list(dict.fromkeys(list(active.get('old_ids') or []) + [str(gate['target_id'])])),
+                    target_exit_id=latest,
+                    target_public_ip=str((self._qizi_find_exit(latest) or {}).get('public_ip') or ''),
+                    start_coord=current or point, start_source='到达后游走最新坐标',
+                    created=now, next_try=0, last_wait_reason='',
+                    was_allowed=bool(active.get('was_allowed', False)))
+                self._qizi_auto_route_active.pop(uid, None)
+                with self.device_lock:
+                    d = self.devices.get(ip)
+                    if d is not None:
+                        d['qizi_dynamic_source_exit_id'] = str(gate['target_id'])
+                        d['qizi_dynamic_follow_exit_id'] = latest
+                        d.pop('qizi_dynamic_walk_gate', None)
+                self._qizi_save_devices(self.devices)
+                self._qizi_dynamic_block(ip, uid, '到达后游走期间IP再变更，放弃原放行，规划最新出口')
+                return
+            if self.ios_states.get(uid, {}).get('wifi') != '连接中':
+                gate['first_ack'] = None
+                gate['needs_restart'] = True
+                return
+            if gate.pop('needs_restart', False):
+                coord = self.coordinates.get(uid) or {}
+                if coord.get('lat') is not None and coord.get('lon') is not None:
+                    self.ios.send(uid, dict(op='start', lat=coord['lat'], lon=coord['lon'], interval=1))
+                    gate['wall_started'] = time.time()
+                    gate['first_ack'] = None
+            record = (getattr(self, '_qizi_live_positions', {}) or {}).get(uid) or {}
+            try:
+                acknowledged = (record.get('mode') == 'walk' and bool(record.get('confirmed'))
+                                and float(record.get('updated') or 0) >= gate['wall_started'])
+            except (ValueError, TypeError):
+                acknowledged = False
+            if acknowledged:
+                # A single old ACK is not ten seconds of functioning GPS.
+                if time.time()-float(record.get('updated') or 0) > 3.5:
+                    acknowledged = False
+            if not acknowledged:
+                gate['first_ack'] = None
+                # No ACK: stay BLOCKED. Retry at most once per 20 seconds,
+                # never reset walking every GUI tick or count a queue write as GPS.
+                if (now >= float(gate.get('retry_due') or 0)
+                        and (not math.isfinite(float(gate.get('wall_started') or 0))
+                             or time.time()-float(gate.get('wall_started') or 0) >= 20)):
+                    gate['retry_due'] = now+20
+                    coord = self.coordinates.get(uid, {}) or {}
+                    if coord.get('lat') is not None and coord.get('lon') is not None:
+                        if self.ios.send(uid, dict(op='start', lat=coord['lat'], lon=coord['lon'], interval=1)):
+                            gate['wall_started'] = time.time()
+                            self.log_operation(f'{ip}：新IP游走尚无有效DVT回执；按20秒退避重试，网络继续禁止')
+                return
+            if gate.get('first_ack') is None:
+                gate['first_ack'] = now
+                self.log_operation(f'{ip}：新IP坐标已收到DVT发送成功回执；开始计算10秒随机游走')
+            if now-gate['first_ack'] < 10.0:
+                return
+            if str(self.devices.get(ip, {}).get('exit_id') or '') != '__QIZI_BLOCK__':
+                # Someone changed the device mode; never override manual policy.
+                self.log_operation(f'{ip}：游走完成但网络策略已变化，取消自动放行')
+                self._qizi_auto_route_active.pop(uid, None)
+                return
+            if str((self._qizi_find_exit(target_id) or {}).get('public_ip') or '') != str(gate['public_ip']):
+                return  # the IP must still be the verified generation
+            with self.device_lock:
+                d=self.devices.get(ip)
+                if d is None or self.uid_for_ip(ip) != uid: return
+                d['exit_id'] = target_id
+                d.pop('qizi_dynamic_source_exit_id', None)
+                d.pop('qizi_dynamic_follow_exit_id', None)
+                d.pop('qizi_dynamic_walk_gate', None)
+            self._qizi_save_devices(self.devices)
+            self._qizi_auto_route_active.pop(uid, None)
+            old_ids = list(dict.fromkeys(str(x) for x in
+                list(active.get('old_ids') or []) + [active.get('old_id')] if x))
+            self._qizi_dynamic_complete_groups(uid, old_ids)
+            self._qizi_dynamic_save_coordinates(uid, ip=ip, target_id=target_id,
+                target_ip=proxy.get('public_ip'), dest=point,
+                status='新IP定位已确认并游走10秒，放行已核实出口')
+            self._sync_location_network_policy()
+            self.refresh_devices(ip)
+            self.log_operation(f'{ip}：动态IP到达完成，新经纬度已同步，随机游走持续至少10秒后放行出口 {gate["public_ip"]}')
+            return
+
+        if not dest or self.ios_states.get(uid, {}).get('wifi') != '连接中':
+            self.log_operation(f'{ip}：已到达，但新公网IP坐标缺失或Wi-Fi断开，保持禁止网络等待补齐')
+            return
+        # Keep BLOCK while the base finish tears down the route and sends its
+        # final static hold. The subsequent start on the SAME DVT worker wins.
+        state = self.route_states.get(uid)
+        if not isinstance(state, dict): return
+        state['target_exit_id'] = '__QIZI_BLOCK__'
+        active['finishing'] = True
+        try:
+            super()._finish_route(uid)
+        except Exception as exc:
+            self.log_operation(f'{ip}：新IP游走交接失败：{type(exc).__name__}: {str(exc)[:120]}')
+            return
+        finally:
+            active['finishing'] = False
+        coord = dict(lat=str(point[0]), lon=str(point[1]), interval=1)
+        self.coordinates[uid] = coord
+        self.coordinates.pop('ip:'+ip, None)
+        # Finished-route hold and STOP snapshot must not take ownership of the
+        # new IP's random walk or overwrite its coordinates on next reconnect.
+        getattr(self, '_qizi_route_hold', {}).pop(uid, None)
+        getattr(self, '_qizi_hold_issued', {}).pop(uid, None)
+        saved = getattr(self, '_qizi_stopped_positions', None)
+        if isinstance(saved, dict) and uid in saved:
+            saved.pop(uid, None)
+            if hasattr(self, '_qizi_save_stopped_positions'):
+                self._qizi_save_stopped_positions()
+        self.save_ios()
+        self._qizi_store_live_coordinate(uid, *point, 'walk', False)
+        self._qizi_set_intent(uid, True)
+        active['qizi_walk_gate'] = dict(target_id=target_id,
+            public_ip=str(proxy.get('public_ip') or ''), wall_started=time.time(), first_ack=None)
+        with self.device_lock:
+            d = self.devices.get(ip)
+            if d is not None:
+                d['qizi_dynamic_walk_gate'] = dict(target_id=target_id,
+                    public_ip=str(proxy.get('public_ip') or ''), lat=coord['lat'], lon=coord['lon'])
+                d['qizi_dynamic_source_exit_id'] = str(active.get('old_id') or '')
+                d['qizi_dynamic_follow_exit_id'] = target_id
+        self._qizi_save_devices(self.devices)
+        if self.ios.send(uid, dict(op='start', **coord)):
+            self.ios_states.setdefault(uid, {})['location'] = '准备发送'
+            self.log_operation(f'{ip}：寻路到达后已补齐最新公网IP {proxy.get("public_ip")} 的经纬度，'
+                               '已启动随机游走；等真实DVT回执后持续10秒再放行')
+        else:
+            active['qizi_walk_gate']['wall_started'] = float('inf')
+            self.log_operation(f'{ip}：新IP随机游走启动失败，保持禁止网络，等待Wi-Fi恢复')
+        self.refresh_devices(ip)
+
     def _qizi_arrival_finish(self, uid, settle_leg_only=False):
         """Settle one frozen route leg, then either release or queue next hop.
 
@@ -1779,6 +1968,8 @@ class QiziDynamicMixin:
         near = (not settle_leg_only and
                 (same_generation or (distance is not None and distance <= 1e-9)))
         ip = active['ip']
+        if near or active.get('qizi_walk_gate'):
+            return self._qizi_arrival_walk_gate(uid, active, target_id, proxy, dest, origin)
         active['finishing'] = True
         state = self.route_states.get(uid)
         if not isinstance(state, dict):
@@ -1881,6 +2072,29 @@ class QiziDynamicMixin:
             self._qizi_auto_route_paused[uid] = active
             self._qizi_dynamic_block(active['ip'], uid, '模拟寻路中途停止，保留原有暂停/断点机制')
         return result
+
+    def _qizi_route_plan_worker(self):
+        while not self._qizi_route_plan_stopping.is_set():
+            try:
+                job = self._qizi_route_plan_jobs.get(timeout=.3)
+            except queue.Empty:
+                continue
+            if job is None:
+                return
+            try:
+                job()
+            except Exception as exc:
+                # The job itself normally emits auto_plan errors. If this
+                # unexpected guard fires, keep the shared worker alive.
+                self._qizi_api_results.put(('auto_log', '共享规划线程',
+                    f'规划执行异常：{type(exc).__name__}: {str(exc)[:180]}'))
+
+    def close(self):
+        self._qizi_route_plan_stopping.set()
+        for _ in self._qizi_route_plan_threads:
+            try: self._qizi_route_plan_jobs.put_nowait(None)
+            except queue.Full: break
+        return super().close()
 
     def _qizi_api_route_change(self, eid):
         """仅撤销使用此出口的旧代理隧道；再发布新路由。"""

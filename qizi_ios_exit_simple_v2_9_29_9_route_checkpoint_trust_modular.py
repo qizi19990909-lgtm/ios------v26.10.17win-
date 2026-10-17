@@ -353,8 +353,13 @@ class PersistentLocationBridge:
         now = _time.monotonic()
         if op in ("start", "update", "once"):
             # The helper is latest-wins, so older unsent set requests can be forgotten here too.
-            for old_id,(old_op,old_generation,_old_at) in list(self.pending.items()):
-                if old_op in ("start", "update", "once") and old_generation == generation:
+            # Do NOT discard an in-flight request merely because a newer 1 Hz
+            # coordinate has arrived. Its eventual DVT ACK is the only reliable
+            # evidence that the phone accepted a location update. The helper
+            # already collapses *unsent* coordinates to latest-wins.
+            for old_id,(old_op,old_generation,old_at) in list(self.pending.items()):
+                if (old_op in ("start", "update", "once") and
+                        (old_generation != generation or now-old_at > 24.0)):
                     self.pending.pop(old_id, None)
                     self.pending_targets.pop(old_id, None)
         elif op in ("stop", "clear"):
@@ -544,6 +549,7 @@ def run_ios_session(udid, pmd, commands, emit, register):
     tunnel=None
     clear=None
     locations=[]
+    cli_requests={}
     location_bridge=None
     persistent_location=False
     results=queue.Queue()
@@ -615,7 +621,8 @@ def run_ios_session(udid, pmd, commands, emit, register):
         persistent_capable=bool(persistent_location)
         bridge_restarts_since_ack=0
         last_bridge_recovery_at=0.0
-        LOCATION_ACK_TIMEOUT_S=3.5
+        LOCATION_ACK_TIMEOUT_S=12.0
+        last_bridge_open_attempt_at = time.monotonic() if not persistent_location else 0.0
 
         target=None
         base_target=None
@@ -910,8 +917,10 @@ def run_ios_session(udid, pmd, commands, emit, register):
             epoch+=1
             for proc,_,_ in locations:kill(proc)
             locations.clear()
+            cli_requests.clear()
         def _open_persistent_bridge(timeout=12.0):
-            nonlocal location_bridge,persistent_location
+            nonlocal location_bridge,persistent_location,last_bridge_open_attempt_at
+            last_bridge_open_attempt_at = time.monotonic()
             bridge=None
             try:
                 bridge=PersistentLocationBridge(interpreter,endpoint,launch,kill,emit,flags)
@@ -1003,15 +1012,15 @@ def run_ios_session(udid, pmd, commands, emit, register):
                 stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8',
                 errors='replace',creationflags=flags)
             locations.append((proc,epoch,now))
+            cli_requests[proc] = (target, 'walk' if active else ('route' if route_active else 'once'), epoch)
             threading.Thread(target=collect,args=(proc,epoch),daemon=True).start()
             while len(locations)>3:
                 oldest=locations.pop(0)
+                cli_requests.pop(oldest[0], None)
                 threading.Thread(target=kill,args=(oldest[0],),daemon=True).start()
-            count+=1
-            emit('sent',location='定位中' if (active or route_active) else '已发送',count=count,
-                 last=time.strftime('%H:%M:%S'),backend='cli-fallback',confirmed=False,
-                 lat=target[0] if target else None,lon=target[1] if target else None,
-                 movement='walk' if active else ('route' if route_active else 'once'))
+            # Subprocess creation is NOT location success. Only its return
+            # code can provide a minimal (CLI-level) confirmation.
+            emit('state',location='准备发送',backend='cli-fallback')
             return True
         while True:
             if tunnel.poll() is not None:raise RuntimeError('Wi-Fi Tunnel 已断开')
@@ -1037,11 +1046,16 @@ def run_ios_session(udid, pmd, commands, emit, register):
                     interval=float(cmd.get('interval',1))
                     if not(-90<=lat<=90 and -180<=lon<=180 and 1<=interval<=60):raise ValueError('经纬度或间隔错误')
                     if base_target is not None and base_target!=(lat,lon) and op!='route':discard_locations()
-                    if persistent_capable and (not persistent_location or location_bridge is None):
+                    if (persistent_capable and (not persistent_location or location_bridge is None)
+                            and time.monotonic()-last_bridge_open_attempt_at >= 30.0):
                         _open_persistent_bridge(timeout=10.0)
                     if op=='start':
+                        # Repeated recovery/start for the SAME center must not
+                        # reset the current random segment or its pause timer.
+                        # A genuine new origin is deliberately re-planned.
+                        if not active or base_target != (lat,lon):
+                            reset_walk(lat,lon)
                         active=True;route_active=False;hold_active=False
-                        reset_walk(lat,lon)
                     else:
                         active=False;route_active=(op in ('route','hold'));hold_active=(op=='hold')
                         base_target=(lat,lon)
@@ -1106,6 +1120,18 @@ def run_ios_session(udid, pmd, commands, emit, register):
                 try:proc,version,rc,error=results.get_nowait()
                 except queue.Empty:break
                 locations[:]=[x for x in locations if x[0] is not proc]
+                info=cli_requests.pop(proc, None)
+                if version != epoch or info is None:
+                    continue
+                point,movement,_=info
+                if rc == 0:
+                    count += 1
+                    emit('sent',location='定位中' if (active or route_active or hold_active) else '已发送',
+                         count=count,last=time.strftime('%H:%M:%S'),backend='cli-fallback',
+                         confirmed=True,lat=point[0],lon=point[1],movement=movement)
+                else:
+                    emit('location_error',location='定位未确认',
+                         error='CLI定位发送失败：'+str(error)[-600:])
             now=time.monotonic()
             if (active or route_active) and persistent_location and location_bridge is not None:
                 try:

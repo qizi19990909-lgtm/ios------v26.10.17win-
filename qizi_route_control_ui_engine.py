@@ -213,6 +213,52 @@ class QiziRouteControlMixin:
             return
         self._qizi_resume_paused(uid)
 
+    def _qizi_clear_stale_device_links(self, ip):
+        """Remove the source/future association and pending walk gate on STOP."""
+        with self.device_lock:
+            device = self.devices.get(ip)
+            if device is None:
+                return
+            touched = False
+            for key in ('qizi_dynamic_source_exit_id',
+                        'qizi_dynamic_follow_exit_id', 'qizi_dynamic_walk_gate'):
+                if key in device:
+                    device.pop(key, None)
+                    touched = True
+        if touched:
+            self._qizi_save_devices(self.devices)
+
+    def _qizi_cancel_pending(self, uid, reason, prune=True):
+        uid = str(uid)
+        task = self._qizi_auto_route_pending.pop(uid, None)
+        self._qizi_auto_route_planning.discard(uid)
+        if task:
+            self.log_operation(f'{task.get("ip") or uid}：{reason}')
+        if prune:
+            self._qizi_dynamic_prune_retired()
+
+    def _qizi_discard_route_checkpoint(self, uid):
+        """Clear only this phone's route, not other phones or their histories."""
+        uid = str(uid)
+        runtime = self.route_runtime.get(uid, {})
+        job = runtime.pop('job', None)
+        if job is not None and job != 'qizi-shared-route':
+            try: self.after_cancel(job)
+            except Exception: pass
+        getattr(self, '_qizi_route_schedule', {}).pop(uid, None)
+        getattr(self, '_qizi_route_ack_waiting', {}).pop(uid, None)
+        getattr(self, '_qizi_route_pending_points', {}).pop(uid, None)
+        self.route_states.pop(uid, None)
+        self.route_plans.pop(uid, None)
+        self._save_route_state()
+        self._save_route_plans()
+        positions = getattr(self, '_qizi_route_positions', None)
+        if isinstance(positions, dict) and uid in positions:
+            positions.pop(uid, None)
+            path = getattr(self, '_qizi_route_checkpoint_path', None)
+            if path is not None:
+                save_route_plans(path, positions)
+
     def _stop_route(self, uid, manual=True, status_var=None):
         # Finish-route / automatic waypoint handoff MUST preserve the existing
         # dynamic multi-generation arrival and verification mechanism.
@@ -221,9 +267,14 @@ class QiziRouteControlMixin:
         uid = str(uid)
         state = self.route_states.get(uid, {})
         ip = str(state.get('ip') or self._ip_for_uid(uid) or '')
-        was_route = bool(state.get('running') or state.get('paused'))
+        walk_gate = (self._qizi_auto_route_active.get(uid, {}) or {}).get('qizi_walk_gate')
+        was_route = bool(state.get('running') or state.get('paused') or walk_gate)
         was_pending = uid in getattr(self, '_qizi_auto_route_pending', {})
         pos = self._qizi_route_position(uid, prefer_ack=True) if was_route else None
+        if pos is None and walk_gate:
+            live = getattr(self, '_qizi_live_positions', {}).get(uid, {})
+            coord = live or self.coordinates.get(uid, {})
+            pos = self._qizi_safe_point(coord.get('lat'), coord.get('lon'))
         self._qizi_resume_after_boot.discard(uid)
         self._qizi_resume_boot_scheduled.discard(uid)
         self._qizi_hold_issued.pop(uid, None)
