@@ -11,6 +11,7 @@ from qizi_gateway_ui_engine import make_gateway_ui_mixin
 from qizi_route_ui_engine import make_route_ui_mixin
 from qizi_trust_reset_ui_engine import make_trust_reset_ui_mixin
 from qizi_reliability_ui_engine import QiziReliabilityMixin
+from qizi_route_control_ui_engine import QiziRouteControlMixin
 
 def make_app_class(BaseApp, context):
     # 依赖注入旧程序的配置和保存函数，避免复制整个主程序。
@@ -403,7 +404,7 @@ def make_app_class(BaseApp, context):
             return result
 
 
-    class QiziReliableApp(QiziReliabilityMixin, QiziBulkGeoApp):
+    class QiziReliableApp(QiziRouteControlMixin, QiziReliabilityMixin, QiziBulkGeoApp):
         """Final cooperative reliability layer for the existing app."""
         pass
 

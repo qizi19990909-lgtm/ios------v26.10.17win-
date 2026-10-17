@@ -1,0 +1,1 @@
+py -3.13 -m PyInstaller --clean --noconfirm "多设备管理器_v3.10.10.1_模块化.spec"
